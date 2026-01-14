@@ -6,6 +6,7 @@ Tự động tìm kiếm và thu thập thông tin doanh nghiệp từ Google Ma
 import json
 import asyncio
 import re
+import random
 from datetime import datetime
 from typing import List, Dict, Optional
 from playwright.async_api import async_playwright, Page, BrowserContext, TimeoutError as PlaywrightTimeoutError
@@ -14,10 +15,11 @@ from playwright.async_api import async_playwright, Page, BrowserContext, Timeout
 class GoogleMapsScraper:
     """Scraper Google Maps sử dụng Playwright"""
     
-    def __init__(self, headless: bool = False, concurrent_tabs: int = 5):
+    def __init__(self, headless: bool = False, concurrent_tabs: int = 3):
         self.headless = headless
         self.concurrent_tabs = concurrent_tabs
         self.max_scroll_attempts = 10  # Số lần scroll tối đa để load hết kết quả
+        self.max_retries = 3  # Số lần retry khi timeout
     
     async def search_google_maps(self, query: str, page: Page, context: BrowserContext) -> List[Dict]:
         """
@@ -217,6 +219,12 @@ class GoogleMapsScraper:
                         print(f"      ⚠️ Error in batch: {result}")
                 
                 total_processed += len(batch_urls)
+                
+                # Delay between batches với random jitter (anti-detection)
+                if batch_idx + batch_size < len(urls):
+                    batch_delay = 1.5 + random.uniform(0, 1)
+                    await asyncio.sleep(batch_delay)
+                
                 print()
             
             print(f"   ✅ Đã parse thành công {len(businesses)}/{max_items} kết quả")
@@ -230,7 +238,7 @@ class GoogleMapsScraper:
     
     async def _extract_from_url(self, url: str, context: BrowserContext, index: int, total: int) -> Optional[Dict]:
         """
-        Mở URL trong tab mới và extract business info
+        Mở URL trong tab mới và extract business info với retry logic
         
         Args:
             url: Business detail URL
@@ -242,45 +250,70 @@ class GoogleMapsScraper:
             Business info dict hoặc None
         """
         page = None
-        try:
-            # Mở tab mới
-            page = await context.new_page()
-            
-            # Stagger tab opening để tránh bị detect (50ms delay)
-            await asyncio.sleep(0.05 * (index % 5))
-            
-            # Navigate với timeout đủ dài
-            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            
-            # Thay vì wait networkidle, wait cho selector quan trọng
+        
+        # Retry with exponential backoff
+        for attempt in range(self.max_retries):
             try:
-                # Wait cho tên business xuất hiện
-                await page.wait_for_selector('h1', timeout=8000)
-            except:
-                # Nếu không có h1, vẫn thử extract
-                pass
-            
-            # Thêm delay nhỏ để panel load đầy đủ
-            await asyncio.sleep(1)
-            
-            # Extract info
-            business_info = await self._extract_from_detail_panel(page)
-            
-            if business_info and business_info.get('name'):
-                print(f"      ✓ [{index}/{total}] {business_info['name'][:50]}")
-                if business_info.get('phone'):
-                    print(f"          📞 {business_info['phone']}")
-            else:
-                print(f"      ⚠️ [{index}/{total}] Không lấy được thông tin")
-            
-            return business_info
-            
-        except Exception as e:
-            print(f"      ❌ [{index}/{total}] Lỗi: {type(e).__name__}: {str(e)[:50]}")
-            return None
-        finally:
-            if page:
+                # Mở tab mới
+                page = await context.new_page()
+                
+                # Stagger tab opening với random jitter để tránh bị detect
+                base_delay = 0.05 * (index % self.concurrent_tabs)
+                jitter = random.uniform(0, 0.1)
+                await asyncio.sleep(base_delay + jitter)
+                
+                # Navigate với timeout tăng dần theo attempt
+                timeout = 30000 * (attempt + 1)
+                await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+                
+                # Thay vì wait networkidle, wait cho selector quan trọng
+                try:
+                    # Wait cho tên business xuất hiện
+                    await page.wait_for_selector('h1', timeout=8000)
+                except:
+                    # Nếu không có h1, vẫn thử extract
+                    pass
+                
+                # Thêm delay nhỏ với random jitter để panel load đầy đủ
+                await asyncio.sleep(1 + random.uniform(0, 0.3))
+                
+                # Extract info
+                business_info = await self._extract_from_detail_panel(page)
+                
+                if business_info and business_info.get('name'):
+                    print(f"      ✓ [{index}/{total}] {business_info['name'][:50]}")
+                    if business_info.get('phone'):
+                        print(f"          📞 {business_info['phone']}")
+                else:
+                    print(f"      ⚠️ [{index}/{total}] Không lấy được thông tin")
+                
+                # Success - close page and return
                 await page.close()
+                return business_info
+                
+            except PlaywrightTimeoutError as e:
+                if page:
+                    await page.close()
+                    page = None
+                
+                if attempt < self.max_retries - 1:
+                    # Exponential backoff before retry
+                    backoff = (2 ** attempt) + random.uniform(0, 1)
+                    print(f"      🔄 [{index}/{total}] Timeout, đang retry sau {backoff:.1f}s...")
+                    await asyncio.sleep(backoff)
+                else:
+                    print(f"      ❌ [{index}/{total}] Lỗi: Timeout sau {self.max_retries} lần thử")
+                    return None
+                    
+            except Exception as e:
+                if page:
+                    await page.close()
+                    page = None
+                    
+                print(f"      ❌ [{index}/{total}] Lỗi: {type(e).__name__}: {str(e)[:50]}")
+                return None
+        
+        return None
     
     async def _extract_from_detail_panel(self, page: Page) -> Optional[Dict]:
         """
@@ -573,10 +606,22 @@ class GoogleMapsScraper:
                     all_results[query] = businesses
                     print(f"   ✅ Tổng cộng: {len(businesses)} kết quả\n")
                     
-                    # Delay
+                    # 💾 Incremental save để tránh mất data khi crash
+                    temp_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    temp_file = f"temp_incremental_{temp_timestamp}.json"
+                    
+                    try:
+                        with open(temp_file, 'w', encoding='utf-8') as f:
+                            json.dump(all_results, f, ensure_ascii=False, indent=2)
+                        print(f"   💾 Đã lưu tạm: {temp_file}")
+                    except Exception as e:
+                        print(f"   ⚠️ Không thể lưu tạm: {e}")
+                    
+                    # Delay với random jitter
                     if i < len(queries):
-                        print(f"   ⏳ Chờ {delay}s trước query tiếp theo...")
-                        await asyncio.sleep(delay)
+                        delay_time = delay + random.uniform(0, 2)
+                        print(f"   ⏳ Chờ {delay_time:.1f}s trước query tiếp theo...")
+                        await asyncio.sleep(delay_time)
             
             finally:
                 await browser.close()
@@ -584,13 +629,15 @@ class GoogleMapsScraper:
         return all_results
 
 
-def save_results(results: Dict[str, List[Dict]], output_file: str, timestamp: str = ""):
-    """Lưu kết quả vào JSON file với timestamp prefix
+def save_results(results: Dict[str, List[Dict]], output_file: str, timestamp: str = "", chunk_size: int = 1000):
+    """Lưu kết quả vào JSON files với timestamp prefix
+    Tự động chia thành nhiều files nếu > chunk_size records
     
     Args:
         results: Kết quả scraping
         output_file: Tên file gốc
         timestamp: Timestamp để thêm vào prefix (format: YYYYMMDD_HHMMSS)
+        chunk_size: Số records tối đa mỗi file (default: 1000)
     """
     # Gộp và loại trùng
     all_businesses = []
@@ -605,22 +652,58 @@ def save_results(results: Dict[str, List[Dict]], output_file: str, timestamp: st
                 seen_names.add(name)
                 all_businesses.append(business)
     
-    # Thêm timestamp vào tên file nếu có
-    if timestamp:
-        # Tách tên file và extension
-        if '.' in output_file:
-            name_parts = output_file.rsplit('.', 1)
-            final_filename = f"{timestamp}_{name_parts[0]}.{name_parts[1]}"
+    total_records = len(all_businesses)
+    
+    # Tính số files cần thiết
+    num_files = (total_records + chunk_size - 1) // chunk_size
+    
+    print(f"\n💾 Tổng cộng {total_records} doanh nghiệp")
+    
+    if num_files == 1:
+        # Chỉ 1 file, lưu bình thường
+        if timestamp:
+            if '.' in output_file:
+                name_parts = output_file.rsplit('.', 1)
+                final_filename = f"{timestamp}_{name_parts[0]}.{name_parts[1]}"
+            else:
+                final_filename = f"{timestamp}_{output_file}"
         else:
-            final_filename = f"{timestamp}_{output_file}"
+            final_filename = output_file
+        
+        with open(final_filename, 'w', encoding='utf-8') as f:
+            json.dump(all_businesses, f, ensure_ascii=False, indent=2)
+        
+        print(f"✅ Đã lưu vào: {final_filename}")
     else:
-        final_filename = output_file
-    
-    # Lưu file
-    with open(final_filename, 'w', encoding='utf-8') as f:
-        json.dump(all_businesses, f, ensure_ascii=False, indent=2)
-    
-    print(f"\n💾 Đã lưu {len(all_businesses)} doanh nghiệp vào {final_filename}")
+        # Nhiều files, chia thành chunks
+        print(f"📦 Sẽ chia thành {num_files} files ({chunk_size} records/file)")
+        
+        for i in range(num_files):
+            start_idx = i * chunk_size
+            end_idx = min((i + 1) * chunk_size, total_records)
+            chunk_data = all_businesses[start_idx:end_idx]
+            
+            # Tạo tên file với số thứ tự
+            if timestamp:
+                if '.' in output_file:
+                    name_parts = output_file.rsplit('.', 1)
+                    chunk_filename = f"{timestamp}_{name_parts[0]}_part{i+1:03d}.{name_parts[1]}"
+                else:
+                    chunk_filename = f"{timestamp}_{output_file}_part{i+1:03d}"
+            else:
+                if '.' in output_file:
+                    name_parts = output_file.rsplit('.', 1)
+                    chunk_filename = f"{name_parts[0]}_part{i+1:03d}.{name_parts[1]}"
+                else:
+                    chunk_filename = f"{output_file}_part{i+1:03d}"
+            
+            with open(chunk_filename, 'w', encoding='utf-8') as f:
+                json.dump(chunk_data, f, ensure_ascii=False, indent=2)
+            
+            print(f"   ✓ Part {i+1}/{num_files}: {chunk_filename} ({len(chunk_data)} records)")
+        
+        print(f"\n✅ Đã chia và lưu thành {num_files} files")
+
 
 
 # ===== Các hàm helper để nhập query =====
@@ -703,12 +786,12 @@ async def main():
     """Hàm chính"""
     import sys
     
-    # ============== CẤU HÌNH ==============
+    # ============== CẤU HÌNH (Conservative - An toàn) ==============
     OUTPUT_FILE = "google_maps_results.json"
     HEADLESS = False  # False = hiện browser để xem process
-    DELAY_BETWEEN_SEARCHES = 5  # Giây
-    CONCURRENT_TABS = 5  # Số tabs song song
-    # =====================================
+    DELAY_BETWEEN_SEARCHES = 8  # Tăng từ 5->8s để tránh detection
+    CONCURRENT_TABS = 3  # Giảm từ 5->3 tabs để an toàn hơn
+    # ===============================================================
     
     print("=" * 70)
     print("🗺️  GOOGLE MAPS BUSINESS SCRAPER (ASYNC MULTI-TAB)")
@@ -750,6 +833,9 @@ async def main():
     print()
     
     print(f"⚡ Chế độ: {CONCURRENT_TABS} tabs song song (async)")
+    print(f"🔄 Retry: Tối đa 3 lần/item với exponential backoff")
+    print(f"⏱️  Delay: {DELAY_BETWEEN_SEARCHES}s + random jitter")
+    print(f"💾 Incremental save: Sau mỗi query")
     print()
     
     # Khởi tạo scraper
@@ -761,8 +847,8 @@ async def main():
     # Tạo timestamp khi hoàn thành
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    # Lưu kết quả với timestamp
-    save_results(results, OUTPUT_FILE, timestamp=timestamp)
+    # Lưu kết quả với timestamp và auto-split mỗi 1000 records
+    save_results(results, OUTPUT_FILE, timestamp=timestamp, chunk_size=1000)
     
     print("\n" + "=" * 70)
     print("✅ HOÀN THÀNH!")
