@@ -4,27 +4,29 @@ Tự động tìm kiếm và thu thập thông tin doanh nghiệp từ Google Ma
 """
 
 import json
-import time
+import asyncio
 import re
 from datetime import datetime
 from typing import List, Dict, Optional
-from playwright.sync_api import sync_playwright, Page, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright, Page, BrowserContext, TimeoutError as PlaywrightTimeoutError
 
 
 class GoogleMapsScraper:
     """Scraper Google Maps sử dụng Playwright"""
     
-    def __init__(self, headless: bool = False):
+    def __init__(self, headless: bool = False, concurrent_tabs: int = 5):
         self.headless = headless
+        self.concurrent_tabs = concurrent_tabs
         self.max_scroll_attempts = 10  # Số lần scroll tối đa để load hết kết quả
     
-    def search_google_maps(self, query: str, page: Page) -> List[Dict]:
+    async def search_google_maps(self, query: str, page: Page, context: BrowserContext) -> List[Dict]:
         """
         Tìm kiếm trên Google Maps và lấy danh sách kết quả
         
         Args:
             query: Từ khóa tìm kiếm
             page: Playwright page instance
+            context: Browser context for multi-tab processing
             
         Returns:
             List các kết quả business
@@ -36,27 +38,23 @@ class GoogleMapsScraper:
         
         try:
             print(f"   🗺️  Đang truy cập Google Maps...")
-            page.goto(maps_url, wait_until="domcontentloaded", timeout=60000)
+            await page.goto(maps_url, wait_until="domcontentloaded", timeout=60000)
             
-            # Đợi kết quả load
+            # Đợi kết quả load với smart wait
             print(f"   ⏳ Đang chờ kết quả Maps load...")
-            time.sleep(5)
-            
-            # Kiểm tra xem có kết quả không
             try:
-                # Đợi sidebar chứa kết quả xuất hiện
-                page.wait_for_selector('div[role="feed"]', timeout=10000)
+                await page.wait_for_selector('div[role="feed"]', timeout=10000)
                 print(f"   ✅ Đã load được danh sách kết quả")
             except:
                 print(f"   ⚠️ Không tìm thấy danh sách kết quả")
                 return []
             
             # Scroll để load tất cả kết quả
-            results_count = self._scroll_to_load_all(page)
+            results_count = await self._scroll_to_load_all(page)
             print(f"   📊 Tổng số kết quả sau khi scroll: {results_count}")
             
-            # Parse tất cả kết quả
-            businesses = self._parse_all_results(page)
+            # Parse tất cả kết quả với multi-tab
+            businesses = await self._parse_all_results_with_tabs(page, context)
             
             return businesses
             
@@ -67,7 +65,7 @@ class GoogleMapsScraper:
             print(f"   ❌ Lỗi: {type(e).__name__}: {e}")
             return []
     
-    def _scroll_to_load_all(self, page: Page) -> int:
+    async def _scroll_to_load_all(self, page: Page) -> int:
         """
         Scroll sidebar để load toàn bộ kết quả
         
@@ -86,7 +84,7 @@ class GoogleMapsScraper:
         
         scrollable_elem = None
         for selector in scrollable_selectors:
-            elem = page.query_selector(selector)
+            elem = await page.query_selector(selector)
             if elem:
                 scrollable_elem = elem
                 print(f"      ✓ Tìm thấy scrollable container: {selector}")
@@ -102,21 +100,21 @@ class GoogleMapsScraper:
             
             for i in range(self.max_scroll_attempts):
                 # Scroll xuống
-                page.evaluate('''
+                await page.evaluate('''
                     const scrollable = document.querySelector('div[role="feed"]');
                     if (scrollable) {
                         scrollable.scrollBy(0, scrollable.scrollHeight);
                     }
                 ''')
                 
-                # Đợi load
-                time.sleep(3)
+                # Đợi load - giảm từ 3s xuống 1.5s
+                await asyncio.sleep(1.5)
                 
                 # Đếm số item
                 # Thử nhiều selector
                 items = []
                 for sel in ['a[href*="/maps/place/"]', 'div[role="article"]', 'a.hfpxzc']:
-                    items = page.query_selector_all(sel)
+                    items = await page.query_selector_all(sel)
                     if items:
                         break
                 
@@ -140,9 +138,9 @@ class GoogleMapsScraper:
             print(f"   ⚠️ Lỗi scroll: {e}")
             return 0
     
-    def _parse_all_results(self, page: Page) -> List[Dict]:
+    async def _parse_all_results_with_tabs(self, page: Page, context: BrowserContext) -> List[Dict]:
         """
-        Parse tất cả kết quả bằng cách click vào từng business
+        Parse tất cả kết quả sử dụng multi-tab parallel processing
         
         Returns:
             List các business info
@@ -150,81 +148,78 @@ class GoogleMapsScraper:
         businesses = []
         
         try:
-            # Dựa vào HTML structure thực tế của Google Maps
-            # Các item thường có class "Nv2PK" hoặc trong div.m6QErb
+            # Thu thập tất cả URLs từ search results
             possible_selectors = [
                 'a.hfpxzc',  # Link chính của mỗi business (phổ biến nhất)
-                'div.Nv2PK',  # Container của mỗi item
-                'div[jsaction*="pane"]',  # Items có jsaction
                 'a[href*="/maps/place/"]',  # Fallback
             ]
             
-            items = []
+            urls = []
             used_selector = None
             
             for selector in possible_selectors:
-                items = page.query_selector_all(selector)
+                items = await page.query_selector_all(selector)
                 if items and len(items) > 0:
                     used_selector = selector
                     print(f"   ✅ Tìm thấy {len(items)} items với selector: {selector}")
+                    
+                    # Extract URLs
+                    for item in items:
+                        href = await item.get_attribute('href')
+                        if href and '/maps/place/' in href:
+                            urls.append(href)
                     break
             
-            if not items:
-                print(f"   ❌ Không tìm thấy items với bất kỳ selector nào!")
+            if not urls:
+                print(f"   ❌ Không tìm thấy business URLs!")
                 # Debug: lưu HTML và screenshot
-                html_content = page.content()
+                html_content = await page.content()
                 with open('debug_maps.html', 'w', encoding='utf-8') as f:
                     f.write(html_content)
-                page.screenshot(path='debug_maps.png')
+                await page.screenshot(path='debug_maps.png')
                 print(f"   💾 Đã lưu debug_maps.html và debug_maps.png")
                 return businesses
             
-            print(f"   📝 Đang parse {len(items)} kết quả...")
-            print(f"   💡 Sẽ click vào từng business để lấy thông tin chi tiết\n")
+            # Loại bỏ duplicates
+            urls = list(dict.fromkeys(urls))
             
-            # Giới hạn số lượng để không quá lâu
-            max_items = min(len(items), 30)
+            # Giới hạn số lượng
+            max_items = min(len(urls), 30)
+            urls = urls[:max_items]
             
-            for i in range(max_items):
-                try:
-                    # Lấy lại element (tránh stale reference)
-                    items = page.query_selector_all(used_selector)
-                    if i >= len(items):
-                        break
-                    
-                    item = items[i]
-                    
-                    print(f"   [{i+1}/{max_items}] Đang xử lý...")
-                    
-                    # Click vào item
-                    item.click()
-                    time.sleep(2.5)  # Đợi panel load đủ lâu
-                    
-                    # Extract thông tin từ detail panel
-                    business_info = self._extract_from_detail_panel(page)
-                    
-                    if business_info and business_info.get('name'):
-                        businesses.append(business_info)
-                        print(f"      ✓ {business_info['name'][:50]}")
-                        if business_info.get('phone'):
-                            print(f"        📞 {business_info['phone']}")
-                        if business_info.get('address') != "Chưa có thông tin":
-                            print(f"        📍 {business_info['address'][:60]}...")
-                        if business_info.get('website'):
-                            print(f"        🌐 {business_info['website'][:60]}...")
-                        if business_info.get('opening_hours'):
-                            print(f"        🕐 {business_info['opening_hours'][:60]}...")
-                    else:
-                        print(f"      ⚠️ Không lấy được thông tin")
-
-                    
-                    print()
-                    
-                except Exception as e:
-                    print(f"      ❌ Lỗi: {e}")
-                    continue
+            print(f"   📝 Sẽ crawl {len(urls)} businesses với {self.concurrent_tabs} tabs song song")
+            print(f"   💡 Multi-tab parallel processing...\n")
             
-            print(f"\n   ✅ Đã parse thành công {len(businesses)}/{max_items} kết quả")
+            # Process URLs in batches
+            batch_size = self.concurrent_tabs
+            total_processed = 0
+            
+            for batch_idx in range(0, len(urls), batch_size):
+                batch_urls = urls[batch_idx:batch_idx + batch_size]
+                batch_num = (batch_idx // batch_size) + 1
+                total_batches = (len(urls) + batch_size - 1) // batch_size
+                
+                print(f"   🔄 Batch {batch_num}/{total_batches}: Processing {len(batch_urls)} items in parallel...")
+                
+                # Process batch in parallel
+                tasks = [
+                    self._extract_from_url(url, context, total_processed + i + 1, max_items)
+                    for i, url in enumerate(batch_urls)
+                ]
+                
+                batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                # Collect successful results
+                for result in batch_results:
+                    if isinstance(result, dict) and result.get('name'):
+                        businesses.append(result)
+                    elif isinstance(result, Exception):
+                        print(f"      ⚠️ Error in batch: {result}")
+                
+                total_processed += len(batch_urls)
+                print()
+            
+            print(f"   ✅ Đã parse thành công {len(businesses)}/{max_items} kết quả")
             return businesses
             
         except Exception as e:
@@ -233,14 +228,66 @@ class GoogleMapsScraper:
             traceback.print_exc()
             return businesses
     
-    def _extract_from_detail_panel(self, page: Page) -> Optional[Dict]:
+    async def _extract_from_url(self, url: str, context: BrowserContext, index: int, total: int) -> Optional[Dict]:
+        """
+        Mở URL trong tab mới và extract business info
+        
+        Args:
+            url: Business detail URL
+            context: Browser context
+            index: Current index for logging
+            total: Total items for logging
+            
+        Returns:
+            Business info dict hoặc None
+        """
+        page = None
+        try:
+            # Mở tab mới
+            page = await context.new_page()
+            
+            # Stagger tab opening để tránh bị detect (50ms delay)
+            await asyncio.sleep(0.05 * (index % 5))
+            
+            # Navigate với timeout đủ dài
+            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            
+            # Thay vì wait networkidle, wait cho selector quan trọng
+            try:
+                # Wait cho tên business xuất hiện
+                await page.wait_for_selector('h1', timeout=8000)
+            except:
+                # Nếu không có h1, vẫn thử extract
+                pass
+            
+            # Thêm delay nhỏ để panel load đầy đủ
+            await asyncio.sleep(1)
+            
+            # Extract info
+            business_info = await self._extract_from_detail_panel(page)
+            
+            if business_info and business_info.get('name'):
+                print(f"      ✓ [{index}/{total}] {business_info['name'][:50]}")
+                if business_info.get('phone'):
+                    print(f"          📞 {business_info['phone']}")
+            else:
+                print(f"      ⚠️ [{index}/{total}] Không lấy được thông tin")
+            
+            return business_info
+            
+        except Exception as e:
+            print(f"      ❌ [{index}/{total}] Lỗi: {type(e).__name__}: {str(e)[:50]}")
+            return None
+        finally:
+            if page:
+                await page.close()
+    
+    async def _extract_from_detail_panel(self, page: Page) -> Optional[Dict]:
         """
         Extract thông tin từ detail panel bên phải
         (Sau khi đã click vào một business)
         """
         try:
-            # Đợi panel load
-            time.sleep(1.5)
             
             # Lấy tên - nhiều selector khác nhau
             name = None
@@ -253,9 +300,10 @@ class GoogleMapsScraper:
             ]
             
             for selector in name_selectors:
-                name_elem = page.query_selector(selector)
+                name_elem = await page.query_selector(selector)
                 if name_elem:
-                    name_text = name_elem.inner_text().strip()
+                    name_text = await name_elem.inner_text()
+                    name_text = name_text.strip()
                     if name_text and len(name_text) > 2:
                         name = name_text
                         break
@@ -267,23 +315,23 @@ class GoogleMapsScraper:
             phone = None
             
             # Cách 1: Tìm button có data-item-id chứa "phone"
-            phone_button = page.query_selector('button[data-item-id*="phone"]')
+            phone_button = await page.query_selector('button[data-item-id*="phone"]')
             if phone_button:
-                aria_label = phone_button.get_attribute('aria-label') or ''
+                aria_label = await phone_button.get_attribute('aria-label') or ''
                 phone = self._extract_phone(aria_label)
             
             # Cách 2: Tìm link tel:
             if not phone:
-                tel_link = page.query_selector('a[href^="tel:"]')
+                tel_link = await page.query_selector('a[href^="tel:"]')
                 if tel_link:
-                    href = tel_link.get_attribute('href') or ''
+                    href = await tel_link.get_attribute('href') or ''
                     phone = self._extract_phone(href)
             
             # Cách 3: Tìm trong aria-label có "Phone"
             if not phone:
-                phone_buttons = page.query_selector_all('button[aria-label*="Phone"], button[aria-label*="Điện thoại"]')
+                phone_buttons = await page.query_selector_all('button[aria-label*="Phone"], button[aria-label*="Điện thoại"]')
                 for btn in phone_buttons:
-                    aria_label = btn.get_attribute('aria-label') or ''
+                    aria_label = await btn.get_attribute('aria-label') or ''
                     phone = self._extract_phone(aria_label)
                     if phone:
                         break
@@ -291,9 +339,9 @@ class GoogleMapsScraper:
             # Cách 4: Tìm trong toàn bộ panel text
             if not phone:
                 # Lấy text từ phần thông tin chi tiết
-                detail_sections = page.query_selector_all('div.rogA2c')  # Sections chứa info
+                detail_sections = await page.query_selector_all('div.rogA2c')  # Sections chứa info
                 for section in detail_sections:
-                    text = section.inner_text()
+                    text = await section.inner_text()
                     phone = self._extract_phone(text)
                     if phone:
                         break
@@ -302,9 +350,9 @@ class GoogleMapsScraper:
             address = "Chưa có thông tin"
             
             # Cách 1: Từ button address
-            addr_button = page.query_selector('button[data-item-id*="address"]')
+            addr_button = await page.query_selector('button[data-item-id*="address"]')
             if addr_button:
-                aria_label = addr_button.get_attribute('aria-label') or ''
+                aria_label = await addr_button.get_attribute('aria-label') or ''
                 if 'Address:' in aria_label or 'Địa chỉ:' in aria_label:
                     parts = aria_label.replace('Address:', '|').replace('Địa chỉ:', '|').split('|')
                     if len(parts) > 1:
@@ -312,9 +360,10 @@ class GoogleMapsScraper:
             
             # Cách 2: Tìm trong div chứa địa chỉ (thường có class fontBodyMedium)
             if address == "Chưa có thông tin":
-                addr_divs = page.query_selector_all('div.fontBodyMedium')
+                addr_divs = await page.query_selector_all('div.fontBodyMedium')
                 for div in addr_divs:
-                    text = div.inner_text().strip()
+                    text = await div.inner_text()
+                    text = text.strip()
                     # Địa chỉ thường có tên thành phố và dài hơn
                     if any(city in text for city in ['Hà Nội', 'TP.HCM', 'Đà Nẵng', 'Cần Thơ', 'Hải Phòng', 'Việt Nam']):
                         if len(text) > 15 and not any(x in text for x in ['★', 'đánh giá', 'rating', 'Mở cửa', 'Đóng cửa']):
@@ -323,29 +372,29 @@ class GoogleMapsScraper:
             
             # Cách 3: Fallback - tìm trong toàn bộ panel
             if address == "Chưa có thông tin":
-                panel_elem = page.query_selector('[role="main"]')
+                panel_elem = await page.query_selector('[role="main"]')
                 if panel_elem:
-                    panel_text = panel_elem.inner_text()
+                    panel_text = await panel_elem.inner_text()
                     address = self._extract_address_from_text(panel_text)
             
             # Lấy website
             website = None
             
             # Cách 1: Tìm button có data-item-id chứa "authority" hoặc "website"
-            website_button = page.query_selector('button[data-item-id*="authority"], button[data-item-id*="website"]')
+            website_button = await page.query_selector('button[data-item-id*="authority"], button[data-item-id*="website"]')
             if website_button:
-                aria_label = website_button.get_attribute('aria-label') or ''
+                aria_label = await website_button.get_attribute('aria-label') or ''
                 # Extract URL từ aria-label
                 website = self._extract_website(aria_label)
             
             # Cách 2: Tìm link có href bắt đầu bằng http
             if not website:
                 # Tìm trong panel chính, tránh các link internal của Google Maps
-                panel_elem = page.query_selector('[role="main"]')
+                panel_elem = await page.query_selector('[role="main"]')
                 if panel_elem:
-                    website_links = panel_elem.query_selector_all('a[href^="http"]')
+                    website_links = await panel_elem.query_selector_all('a[href^="http"]')
                     for link in website_links:
-                        href = link.get_attribute('href') or ''
+                        href = await link.get_attribute('href') or ''
                         # Loại bỏ các link của Google
                         if 'google.com' not in href and 'gstatic.com' not in href:
                             website = href
@@ -355,23 +404,25 @@ class GoogleMapsScraper:
             opening_hours = None
             
             # Cách 1: Tìm button có data-item-id chứa "hours"
-            hours_button = page.query_selector('button[data-item-id*="hours"]')
+            hours_button = await page.query_selector('button[data-item-id*="hours"]')
             if hours_button:
-                aria_label = hours_button.get_attribute('aria-label') or ''
+                aria_label = await hours_button.get_attribute('aria-label') or ''
                 opening_hours = self._extract_opening_hours(aria_label)
             
             # Cách 2: Tìm trong các div chứa thông tin giờ mở cửa
             if not opening_hours:
                 # Tìm text có chứa "Open", "Closes", "Mở cửa", "Đóng cửa"
                 hours_indicators = ['Open', 'Closes', 'Opens', 'Mở cửa', 'Đóng cửa', '24 hours', '24 giờ']
-                all_divs = page.query_selector_all('div.fontBodyMedium, div.fontBodySmall')
+                all_divs = await page.query_selector_all('div.fontBodyMedium, div.fontBodySmall')
                 for div in all_divs:
-                    text = div.inner_text().strip()
+                    text = await div.inner_text()
+                    text = text.strip()
                     if any(indicator in text for indicator in hours_indicators):
                         # Tìm thêm context xung quanh để lấy đầy đủ thông tin
-                        parent = div.evaluate_handle('el => el.parentElement')
+                        parent = await div.evaluate_handle('el => el.parentElement')
                         if parent:
-                            hours_text = parent.as_element().inner_text().strip()
+                            hours_text = await parent.as_element().inner_text()
+                            hours_text = hours_text.strip()
                             if len(hours_text) > 3:
                                 opening_hours = hours_text
                                 break
@@ -475,7 +526,7 @@ class GoogleMapsScraper:
         
         return None
     
-    def run_searches(self, queries: List[str], delay: float = 3.0) -> Dict[str, List[Dict]]:
+    async def run_searches(self, queries: List[str], delay: float = 3.0) -> Dict[str, List[Dict]]:
         """
         Chạy nhiều query search trên Maps
         
@@ -488,11 +539,11 @@ class GoogleMapsScraper:
         """
         all_results = {}
         
-        with sync_playwright() as p:
+        async with async_playwright() as p:
             print("🌐 Đang khởi động browser...")
             
             # Launch với args tương tự batdongsan_final.py
-            browser = p.chromium.launch(
+            browser = await p.chromium.launch(
                 headless=self.headless,
                 args=[
                     '--disable-blink-features=AutomationControlled',
@@ -503,21 +554,21 @@ class GoogleMapsScraper:
             )
             
             # Context options
-            context = browser.new_context(
+            context = await browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 viewport={"width": 1920, "height": 1080},
                 locale="vi-VN",
                 timezone_id="Asia/Ho_Chi_Minh",
             )
             
-            page = context.new_page()
+            page = await context.new_page()
             
             try:
                 for i, query in enumerate(queries, 1):
                     print(f"\n🔍 [{i}/{len(queries)}] Đang search: {query}")
                     
-                    # Search trên Maps
-                    businesses = self.search_google_maps(query, page)
+                    # Search trên Maps với context for multi-tab
+                    businesses = await self.search_google_maps(query, page, context)
                     
                     all_results[query] = businesses
                     print(f"   ✅ Tổng cộng: {len(businesses)} kết quả\n")
@@ -525,10 +576,10 @@ class GoogleMapsScraper:
                     # Delay
                     if i < len(queries):
                         print(f"   ⏳ Chờ {delay}s trước query tiếp theo...")
-                        time.sleep(delay)
+                        await asyncio.sleep(delay)
             
             finally:
-                browser.close()
+                await browser.close()
         
         return all_results
 
@@ -648,7 +699,7 @@ def get_queries_interactive() -> List[str]:
         return queries
 
 
-def main():
+async def main():
     """Hàm chính"""
     import sys
     
@@ -656,10 +707,11 @@ def main():
     OUTPUT_FILE = "google_maps_results.json"
     HEADLESS = False  # False = hiện browser để xem process
     DELAY_BETWEEN_SEARCHES = 5  # Giây
+    CONCURRENT_TABS = 5  # Số tabs song song
     # =====================================
     
     print("=" * 70)
-    print("🗺️  GOOGLE MAPS BUSINESS SCRAPER")
+    print("🗺️  GOOGLE MAPS BUSINESS SCRAPER (ASYNC MULTI-TAB)")
     print("=" * 70)
     
     # ===== NHẬP QUERIES =====
@@ -697,11 +749,14 @@ def main():
         print(f"   {i}. {q}")
     print()
     
+    print(f"⚡ Chế độ: {CONCURRENT_TABS} tabs song song (async)")
+    print()
+    
     # Khởi tạo scraper
-    scraper = GoogleMapsScraper(headless=HEADLESS)
+    scraper = GoogleMapsScraper(headless=HEADLESS, concurrent_tabs=CONCURRENT_TABS)
     
     # Chạy searches
-    results = scraper.run_searches(queries, delay=DELAY_BETWEEN_SEARCHES)
+    results = await scraper.run_searches(queries, delay=DELAY_BETWEEN_SEARCHES)
     
     # Tạo timestamp khi hoàn thành
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -717,4 +772,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
