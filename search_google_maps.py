@@ -1,15 +1,400 @@
 """
 Google Maps Business Scraper
 Tự động tìm kiếm và thu thập thông tin doanh nghiệp từ Google Maps
+Features:
+- Multi-tab parallel processing
+- Graceful shutdown with Ctrl+C (saves progress)
+- Resume from last position (cursor-like)
+- Query-based file naming (e.g. "bất động sản" → "batdongsan")
+- Excel export
 """
 
 import json
 import asyncio
 import re
 import random
+import signal
+import os
 from datetime import datetime
+from pathlib import Path
 from typing import List, Dict, Optional
+from dataclasses import dataclass, field, asdict
 from playwright.async_api import async_playwright, Page, BrowserContext, TimeoutError as PlaywrightTimeoutError
+
+# For Excel export
+try:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    OPENPYXL_AVAILABLE = True
+except ImportError:
+    OPENPYXL_AVAILABLE = False
+    print("⚠️ openpyxl not installed. Run: pip install openpyxl")
+
+# For Vietnamese character removal
+try:
+    from unidecode import unidecode
+    UNIDECODE_AVAILABLE = True
+except ImportError:
+    UNIDECODE_AVAILABLE = False
+    # Fallback mapping for common Vietnamese characters
+    VIETNAMESE_MAP = {
+        'á': 'a', 'à': 'a', 'ả': 'a', 'ã': 'a', 'ạ': 'a',
+        'ă': 'a', 'ắ': 'a', 'ằ': 'a', 'ẳ': 'a', 'ẵ': 'a', 'ặ': 'a',
+        'â': 'a', 'ấ': 'a', 'ầ': 'a', 'ẩ': 'a', 'ẫ': 'a', 'ậ': 'a',
+        'é': 'e', 'è': 'e', 'ẻ': 'e', 'ẽ': 'e', 'ẹ': 'e',
+        'ê': 'e', 'ế': 'e', 'ề': 'e', 'ể': 'e', 'ễ': 'e', 'ệ': 'e',
+        'í': 'i', 'ì': 'i', 'ỉ': 'i', 'ĩ': 'i', 'ị': 'i',
+        'ó': 'o', 'ò': 'o', 'ỏ': 'o', 'õ': 'o', 'ọ': 'o',
+        'ô': 'o', 'ố': 'o', 'ồ': 'o', 'ổ': 'o', 'ỗ': 'o', 'ộ': 'o',
+        'ơ': 'o', 'ớ': 'o', 'ờ': 'o', 'ở': 'o', 'ỡ': 'o', 'ợ': 'o',
+        'ú': 'u', 'ù': 'u', 'ủ': 'u', 'ũ': 'u', 'ụ': 'u',
+        'ư': 'u', 'ứ': 'u', 'ừ': 'u', 'ử': 'u', 'ữ': 'u', 'ự': 'u',
+        'ý': 'y', 'ỳ': 'y', 'ỷ': 'y', 'ỹ': 'y', 'ỵ': 'y',
+        'đ': 'd',
+        'Á': 'A', 'À': 'A', 'Ả': 'A', 'Ã': 'A', 'Ạ': 'A',
+        'Ă': 'A', 'Ắ': 'A', 'Ằ': 'A', 'Ẳ': 'A', 'Ẵ': 'A', 'Ặ': 'A',
+        'Â': 'A', 'Ấ': 'A', 'Ầ': 'A', 'Ẩ': 'A', 'Ẫ': 'A', 'Ậ': 'A',
+        'É': 'E', 'È': 'E', 'Ẻ': 'E', 'Ẽ': 'E', 'Ẹ': 'E',
+        'Ê': 'E', 'Ế': 'E', 'Ề': 'E', 'Ể': 'E', 'Ễ': 'E', 'Ệ': 'E',
+        'Í': 'I', 'Ì': 'I', 'Ỉ': 'I', 'Ĩ': 'I', 'Ị': 'I',
+        'Ó': 'O', 'Ò': 'O', 'Ỏ': 'O', 'Õ': 'O', 'Ọ': 'O',
+        'Ô': 'O', 'Ố': 'O', 'Ồ': 'O', 'Ổ': 'O', 'Ỗ': 'O', 'Ộ': 'O',
+        'Ơ': 'O', 'Ớ': 'O', 'Ờ': 'O', 'Ở': 'O', 'Ỡ': 'O', 'Ợ': 'O',
+        'Ú': 'U', 'Ù': 'U', 'Ủ': 'U', 'Ũ': 'U', 'Ụ': 'U',
+        'Ư': 'U', 'Ứ': 'U', 'Ừ': 'U', 'Ử': 'U', 'Ữ': 'U', 'Ự': 'U',
+        'Ý': 'Y', 'Ỳ': 'Y', 'Ỷ': 'Y', 'Ỹ': 'Y', 'Ỵ': 'Y',
+        'Đ': 'D'
+    }
+
+
+# ===== CONFIGURATION =====
+STATE_DIR = Path("crawl_state")
+OUTPUT_DIR = Path("output")
+
+# Global flags for control
+shutdown_requested = False
+pause_requested = False
+save_requested = False
+
+
+class KeyboardController:
+    """
+    Non-blocking keyboard listener for interactive terminal control.
+    Supports: P (pause/resume), S (save), Q (quit), H (help)
+    """
+    
+    def __init__(self):
+        self.running = False
+        self.thread: Optional[asyncio.Task] = None
+        self._old_settings = None
+        
+    def _get_char_non_blocking(self) -> Optional[str]:
+        """Get a character from stdin without blocking (Unix only)."""
+        import sys
+        import select
+        
+        # Check if there's input available
+        if select.select([sys.stdin], [], [], 0)[0]:
+            try:
+                import termios
+                import tty
+                
+                fd = sys.stdin.fileno()
+                old_settings = termios.tcgetattr(fd)
+                try:
+                    tty.setraw(fd)
+                    ch = sys.stdin.read(1)
+                finally:
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                return ch
+            except (ImportError, termios.error):
+                return sys.stdin.read(1)
+        return None
+    
+    async def listen(self) -> None:
+        """Listen for keyboard input in async loop."""
+        global shutdown_requested, pause_requested, save_requested
+        
+        self.running = True
+        
+        while self.running:
+            try:
+                char = self._get_char_non_blocking()
+                if char:
+                    char_lower = char.lower()
+                    
+                    if char_lower == 'p':
+                        pause_requested = not pause_requested
+                        if pause_requested:
+                            print("\n   ⏸️  PAUSED - Nhấn [P] để tiếp tục...")
+                        else:
+                            print("\n   ▶️  RESUMED - Tiếp tục crawl...")
+                    
+                    elif char_lower == 's':
+                        save_requested = True
+                        print("\n   💾 Save requested...")
+                    
+                    elif char_lower == 'q':
+                        shutdown_requested = True
+                        print("\n   🛑 Quit requested - Đang lưu và thoát...")
+                        break
+                    
+                    elif char_lower == 'h':
+                        self.print_help()
+                
+                await asyncio.sleep(0.1)  # Check every 100ms
+                
+            except Exception:
+                await asyncio.sleep(0.5)
+    
+    def print_help(self) -> None:
+        """Print help menu."""
+        print("\n" + "=" * 50)
+        print("   ⌨️  PHÍM TẮT ĐIỀU KHIỂN")
+        print("=" * 50)
+        print("   [P] - Pause/Resume crawl")
+        print("   [S] - Save state ngay lập tức")
+        print("   [Q] - Quit và lưu dữ liệu")
+        print("   [H] - Hiện menu này")
+        print("=" * 50 + "\n")
+    
+    def start(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Start the keyboard listener."""
+        self.thread = loop.create_task(self.listen())
+    
+    def stop(self) -> None:
+        """Stop the keyboard listener."""
+        self.running = False
+        if self.thread:
+            self.thread.cancel()
+
+
+def print_controls_banner() -> None:
+    """Print the keyboard controls banner."""
+    print("\n" + "─" * 60)
+    print("   ⌨️  PHÍM TẮT: [P]ause  [S]ave  [Q]uit  [H]elp")
+    print("─" * 60 + "\n")
+
+
+def sanitize_query_to_filename(query: str) -> str:
+    """
+    Convert a query string to a valid filename.
+    e.g., "bất động sản Hà Nội" -> "batdongsan_ha_noi"
+    
+    Args:
+        query: The search query string
+        
+    Returns:
+        A sanitized filename-safe string
+    """
+    # First, convert Vietnamese characters to ASCII
+    if UNIDECODE_AVAILABLE:
+        ascii_text = unidecode(query)
+    else:
+        # Fallback: use manual mapping
+        ascii_text = query
+        for viet_char, ascii_char in VIETNAMESE_MAP.items():
+            ascii_text = ascii_text.replace(viet_char, ascii_char)
+    
+    # Convert to lowercase
+    ascii_text = ascii_text.lower()
+    
+    # Replace spaces and special chars with underscore
+    ascii_text = re.sub(r'[^a-z0-9]+', '_', ascii_text)
+    
+    # Remove leading/trailing underscores
+    ascii_text = ascii_text.strip('_')
+    
+    # Collapse multiple underscores
+    ascii_text = re.sub(r'_+', '_', ascii_text)
+    
+    return ascii_text or "query"
+
+
+@dataclass
+class CrawlState:
+    """Manages the crawl state for resume functionality."""
+    query: str
+    filename: str
+    urls: List[str] = field(default_factory=list)
+    current_index: int = 0
+    results: List[Dict[str, str]] = field(default_factory=list)
+    last_updated: str = ""
+    completed: bool = False
+    
+    def save(self) -> None:
+        """Save current state to JSON file."""
+        STATE_DIR.mkdir(exist_ok=True)
+        state_file = STATE_DIR / f"{self.filename}_state.json"
+        
+        self.last_updated = datetime.now().isoformat()
+        
+        with open(state_file, 'w', encoding='utf-8') as f:
+            json.dump(asdict(self), f, ensure_ascii=False, indent=2)
+        
+        print(f"   💾 State saved: {state_file}")
+    
+    @classmethod
+    def load(cls, filename: str) -> Optional['CrawlState']:
+        """Load state from JSON file if exists."""
+        state_file = STATE_DIR / f"{filename}_state.json"
+        
+        if not state_file.exists():
+            return None
+        
+        try:
+            with open(state_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            return cls(
+                query=data['query'],
+                filename=data['filename'],
+                urls=data.get('urls', []),
+                current_index=data.get('current_index', 0),
+                results=data.get('results', []),
+                last_updated=data.get('last_updated', ''),
+                completed=data.get('completed', False)
+            )
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"   ⚠️ Error loading state: {e}")
+            return None
+    
+    @classmethod
+    def find_existing(cls, query: str) -> Optional['CrawlState']:
+        """Find existing state for a query."""
+        filename = sanitize_query_to_filename(query)
+        return cls.load(filename)
+    
+    def mark_completed(self) -> None:
+        """Mark this crawl as completed."""
+        self.completed = True
+        self.save()
+    
+    def delete_state_file(self) -> None:
+        """Delete the state file after successful completion."""
+        state_file = STATE_DIR / f"{self.filename}_state.json"
+        if state_file.exists():
+            state_file.unlink()
+            print(f"   🗑️ State file deleted: {state_file}")
+
+
+def list_saved_states() -> List[Path]:
+    """List all saved state files."""
+    if not STATE_DIR.exists():
+        return []
+    return list(STATE_DIR.glob("*_state.json"))
+
+
+def export_from_state_files() -> None:
+    """
+    Export Excel files from all saved state files.
+    Useful when crawl was interrupted and Excel wasn't exported.
+    """
+    state_files = list_saved_states()
+    
+    if not state_files:
+        print("📂 Không tìm thấy state files trong crawl_state/")
+        return
+    
+    print(f"\n📂 Tìm thấy {len(state_files)} state files:")
+    for i, sf in enumerate(state_files, 1):
+        print(f"   {i}. {sf.name}")
+    
+    print()
+    
+    for state_file in state_files:
+        filename = state_file.stem.replace("_state", "")
+        state = CrawlState.load(filename)
+        
+        if state and state.results:
+            print(f"\n📊 Exporting {state.filename}: {len(state.results)} results")
+            excel_path = save_to_excel(state.results, state.query)
+            if excel_path:
+                print(f"   ✅ Exported: {excel_path}")
+        else:
+            print(f"\n⚠️ {filename}: Không có kết quả để export")
+
+
+def save_to_excel(
+    results: List[Dict[str, str]], 
+    query: str, 
+    output_dir: Path = OUTPUT_DIR
+) -> Optional[Path]:
+    """
+    Save crawl results to an Excel file.
+    
+    Args:
+        results: List of business info dictionaries
+        query: The search query (used for filename)
+        output_dir: Output directory path
+        
+    Returns:
+        Path to the created Excel file, or None if failed
+    """
+    if not OPENPYXL_AVAILABLE:
+        print("   ❌ openpyxl not available. Cannot export to Excel.")
+        print("   💡 Run: pip install openpyxl")
+        return None
+    
+    if not results:
+        print("   ⚠️ No results to export")
+        return None
+    
+    # Create output directory
+    output_dir.mkdir(exist_ok=True)
+    
+    # Generate filename from query
+    filename = sanitize_query_to_filename(query)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    excel_path = output_dir / f"{filename}_{timestamp}.xlsx"
+    
+    # Create workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Results"
+    
+    # Define headers
+    headers = ["STT", "Tên", "Điện thoại", "Địa chỉ", "Website", "Giờ mở cửa"]
+    
+    # Header style
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    header_alignment = Alignment(horizontal="center", vertical="center")
+    thin_border = Border(
+        left=Side(style='thin'),
+        right=Side(style='thin'),
+        top=Side(style='thin'),
+        bottom=Side(style='thin')
+    )
+    
+    # Write headers
+    for col, header in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=header)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = header_alignment
+        cell.border = thin_border
+    
+    # Write data
+    for row, business in enumerate(results, 2):
+        ws.cell(row=row, column=1, value=row - 1).border = thin_border
+        ws.cell(row=row, column=2, value=business.get('name', '')).border = thin_border
+        ws.cell(row=row, column=3, value=business.get('phone', '')).border = thin_border
+        ws.cell(row=row, column=4, value=business.get('address', '')).border = thin_border
+        ws.cell(row=row, column=5, value=business.get('website', '')).border = thin_border
+        ws.cell(row=row, column=6, value=business.get('opening_hours', '')).border = thin_border
+    
+    # Adjust column widths
+    column_widths = [6, 40, 15, 60, 40, 30]
+    for col, width in enumerate(column_widths, 1):
+        ws.column_dimensions[ws.cell(row=1, column=col).column_letter].width = width
+    
+    # Save workbook
+    wb.save(excel_path)
+    print(f"   📊 Excel saved: {excel_path}")
+    print(f"   📈 Total records: {len(results)}")
+    
+    return excel_path
 
 
 class GoogleMapsScraper:
@@ -783,19 +1168,51 @@ def get_queries_interactive() -> List[str]:
 
 
 async def main():
-    """Hàm chính"""
+    """Hàm chính với hỗ trợ resume và graceful shutdown"""
     import sys
+    global shutdown_requested, pause_requested, save_requested
     
     # ============== CẤU HÌNH (Conservative - An toàn) ==============
-    OUTPUT_FILE = "google_maps_results.json"
     HEADLESS = False  # False = hiện browser để xem process
-    DELAY_BETWEEN_SEARCHES = 8  # Tăng từ 5->8s để tránh detection
-    CONCURRENT_TABS = 3  # Giảm từ 5->3 tabs để an toàn hơn
+    DELAY_BETWEEN_SEARCHES = 8  # Delay giữa các query
+    CONCURRENT_TABS = 3  # Số tabs song song
+    BATCH_SAVE_INTERVAL = 5  # Lưu state sau mỗi 5 items
     # ===============================================================
     
+    # Setup signal handlers for graceful shutdown
+    def signal_handler(signum: int, frame) -> None:
+        global shutdown_requested
+        print("\n\n🛑 Đang dừng crawl... Lưu dữ liệu hiện tại...")
+        shutdown_requested = True
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     print("=" * 70)
-    print("🗺️  GOOGLE MAPS BUSINESS SCRAPER (ASYNC MULTI-TAB)")
+    print("🗺️  GOOGLE MAPS BUSINESS SCRAPER")
+    print("   📌 Features: Resume từ vị trí dừng | Graceful shutdown | Excel export")
     print("=" * 70)
+    
+    # Check for special commands
+    if len(sys.argv) >= 2:
+        if sys.argv[1] == "--export":
+            print("📊 Exporting Excel from saved state files...")
+            export_from_state_files()
+            return
+        
+        if sys.argv[1] == "--status":
+            state_files = list_saved_states()
+            if state_files:
+                print(f"\n📂 Saved states ({len(state_files)}):")
+                for sf in state_files:
+                    filename = sf.stem.replace("_state", "")
+                    state = CrawlState.load(filename)
+                    if state:
+                        status = "✅ completed" if state.completed else f"⏸️ {state.current_index}/{len(state.urls)}"
+                        print(f"   • {state.query}: {len(state.results)} results [{status}]")
+            else:
+                print("\n📂 Không có state files nào được lưu")
+            return
     
     # ===== NHẬP QUERIES =====
     queries = None
@@ -816,7 +1233,9 @@ async def main():
         print("\n💡 Hướng dẫn sử dụng:")
         print("   1. Command line: python script.py \"query 1\" \"query 2\"")
         print("   2. Từ file: python script.py --file queries.txt")
-        print("   3. Interactive: nhập trực tiếp\n")
+        print("   3. Export Excel: python script.py --export")
+        print("   4. Xem status: python script.py --status")
+        print("   5. Interactive: nhập trực tiếp\n")
         
         use_interactive = input("Bạn có muốn nhập queries ngay? (y/n): ").lower()
         if use_interactive == 'y':
@@ -832,30 +1251,218 @@ async def main():
         print(f"   {i}. {q}")
     print()
     
-    print(f"⚡ Chế độ: {CONCURRENT_TABS} tabs song song (async)")
-    print(f"🔄 Retry: Tối đa 3 lần/item với exponential backoff")
-    print(f"⏱️  Delay: {DELAY_BETWEEN_SEARCHES}s + random jitter")
-    print(f"💾 Incremental save: Sau mỗi query")
-    print()
+    print(f"⚡ Chế độ: {CONCURRENT_TABS} tabs song song")
+    print(f"⏱️  Delay: {DELAY_BETWEEN_SEARCHES}s giữa các query")
+    print(f"💾 Auto-save: Sau mỗi {BATCH_SAVE_INTERVAL} items")
+    
+    # Print keyboard controls
+    print_controls_banner()
+    
+    # Initialize keyboard controller
+    keyboard_controller = KeyboardController()
     
     # Khởi tạo scraper
     scraper = GoogleMapsScraper(headless=HEADLESS, concurrent_tabs=CONCURRENT_TABS)
     
-    # Chạy searches
-    results = await scraper.run_searches(queries, delay=DELAY_BETWEEN_SEARCHES)
+    # Start keyboard listener
+    loop = asyncio.get_event_loop()
+    keyboard_controller.start(loop)
     
-    # Tạo timestamp khi hoàn thành
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Process each query separately for better resume support
+    for query_idx, query in enumerate(queries, 1):
+        if shutdown_requested:
+            print("\n🛑 Đã dừng theo yêu cầu người dùng")
+            break
+        
+        filename = sanitize_query_to_filename(query)
+        print(f"\n{'='*60}")
+        print(f"🔍 [{query_idx}/{len(queries)}] Query: {query}")
+        print(f"   📁 Filename: {filename}")
+        print(f"{'='*60}")
+        
+        # Check for existing state
+        existing_state = CrawlState.find_existing(query)
+        state: CrawlState
+        
+        if existing_state and not existing_state.completed:
+            print(f"\n📥 Tìm thấy state trước đó:")
+            print(f"   • Đã crawl: {len(existing_state.results)} kết quả")
+            print(f"   • Vị trí: {existing_state.current_index}/{len(existing_state.urls)}")
+            print(f"   • Cập nhật: {existing_state.last_updated}")
+            
+            resume_choice = input("\n   Tiếp tục từ vị trí dừng? (y/n, Enter=y): ").lower().strip()
+            if resume_choice in ['', 'y', 'yes']:
+                state = existing_state
+                print(f"   ✅ Tiếp tục từ index {state.current_index}")
+            else:
+                print("   🔄 Bắt đầu lại từ đầu")
+                state = CrawlState(query=query, filename=filename)
+        else:
+            state = CrawlState(query=query, filename=filename)
+        
+        # Run the crawl
+        async with async_playwright() as p:
+            print("\n🌐 Đang khởi động browser...")
+            
+            browser = await p.chromium.launch(
+                headless=HEADLESS,
+                args=[
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-web-security',
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                ]
+            )
+            
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                viewport={"width": 1920, "height": 1080},
+                locale="vi-VN",
+                timezone_id="Asia/Ho_Chi_Minh",
+            )
+            
+            page = await context.new_page()
+            
+            try:
+                # If we don't have URLs yet, search for them
+                if not state.urls:
+                    print("   🗺️  Đang tìm kiếm trên Google Maps...")
+                    from urllib.parse import quote_plus
+                    
+                    encoded_query = quote_plus(query)
+                    maps_url = f"https://www.google.com/maps/search/{encoded_query}"
+                    
+                    await page.goto(maps_url, wait_until="domcontentloaded", timeout=60000)
+                    
+                    try:
+                        await page.wait_for_selector('div[role="feed"]', timeout=10000)
+                    except:
+                        print("   ⚠️ Không tìm thấy danh sách kết quả")
+                        continue
+                    
+                    # Scroll to load all results
+                    await scraper._scroll_to_load_all(page)
+                    
+                    # Get all URLs
+                    items = await page.query_selector_all('a.hfpxzc')
+                    if not items:
+                        items = await page.query_selector_all('a[href*="/maps/place/"]')
+                    
+                    urls = []
+                    for item in items:
+                        href = await item.get_attribute('href')
+                        if href and '/maps/place/' in href:
+                            urls.append(href)
+                    
+                    urls = list(dict.fromkeys(urls))  # Remove duplicates
+                    state.urls = urls
+                    state.save()
+                    
+                    print(f"   📊 Tìm thấy {len(urls)} địa điểm")
+                
+                # Process URLs from current_index
+                total_urls = len(state.urls)
+                start_index = state.current_index
+                
+                print(f"\n   📝 Đang crawl từ index {start_index + 1}/{total_urls}...")
+                
+                for idx in range(start_index, total_urls):
+                    # Check for pause
+                    while pause_requested and not shutdown_requested:
+                        await asyncio.sleep(0.5)
+                    
+                    if shutdown_requested:
+                        print("\n   🛑 Đang lưu state và thoát...")
+                        state.save()
+                        break
+                    
+                    # Check for manual save request
+                    if save_requested:
+                        state.save()
+                        print(f"\n   💾 Manual save: {len(state.results)} kết quả")
+                        save_requested = False
+                    
+                    url = state.urls[idx]
+                    
+                    # Extract business info
+                    result = await scraper._extract_from_url(url, context, idx + 1, total_urls)
+                    
+                    if result and result.get('name'):
+                        state.results.append(result)
+                    
+                    state.current_index = idx + 1
+                    
+                    # Save state periodically
+                    if (idx + 1) % BATCH_SAVE_INTERVAL == 0:
+                        state.save()
+                        print(f"\n   💾 Đã lưu state ({len(state.results)} kết quả)")
+                    
+                    # Small delay
+                    await asyncio.sleep(0.5 + random.uniform(0, 0.3))
+                
+                # Mark completed if finished all URLs
+                if state.current_index >= total_urls and not shutdown_requested:
+                    state.mark_completed()
+                    print(f"\n   ✅ Hoàn thành query: {len(state.results)} kết quả")
+                
+            except Exception as e:
+                print(f"\n   ❌ Lỗi: {type(e).__name__}: {e}")
+                state.save()  # Save on error
+                
+            finally:
+                await browser.close()
+        
+        # Save to Excel - ALWAYS export if there are results (even if interrupted)
+        if state.results:
+            print(f"\n   📊 Exporting {len(state.results)} results to Excel...")
+            excel_path = save_to_excel(state.results, query)
+            if excel_path:
+                print(f"   ✅ Excel exported: {excel_path}")
+                if state.completed:
+                    state.delete_state_file()
+        else:
+            print("\n   ⚠️ Không có kết quả để export")
+        
+        # Delay before next query
+        if query_idx < len(queries) and not shutdown_requested:
+            delay_time = DELAY_BETWEEN_SEARCHES + random.uniform(0, 2)
+            print(f"\n   ⏳ Chờ {delay_time:.1f}s trước query tiếp theo...")
+            await asyncio.sleep(delay_time)
     
-    # Lưu kết quả với timestamp và auto-split mỗi 1000 records
-    save_results(results, OUTPUT_FILE, timestamp=timestamp, chunk_size=1000)
+    # Stop keyboard listener
+    keyboard_controller.stop()
     
     print("\n" + "=" * 70)
-    print("✅ HOÀN THÀNH!")
-    print(f"📊 Đã search {len(queries)} queries")
-    print(f"📁 Kết quả: {OUTPUT_FILE}")
+    if shutdown_requested:
+        print("🛑 ĐÃ DỪNG - Dữ liệu đã được lưu")
+        print("   💡 Chạy lại script để tiếp tục từ vị trí dừng")
+    else:
+        print("✅ HOÀN THÀNH!")
+    print(f"📊 Đã xử lý {len(queries)} queries")
+    print(f"📁 Kết quả: thư mục {OUTPUT_DIR}/")
     print("=" * 70)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n\n" + "=" * 70)
+        print("🛑 INTERRUPTED BY USER (Ctrl+C)")
+        print("=" * 70)
+        
+        # Export Excel from saved states
+        state_files = list_saved_states()
+        if state_files:
+            print(f"\n📂 Đang export {len(state_files)} state files thành Excel...")
+            for state_file in state_files:
+                filename = state_file.stem.replace("_state", "")
+                state = CrawlState.load(filename)
+                if state and state.results:
+                    print(f"\n   📊 {state.query}: {len(state.results)} results")
+                    excel_path = save_to_excel(state.results, state.query)
+                    if excel_path:
+                        print(f"   ✅ Saved: {excel_path}")
+        
+        print("\n💡 Chạy lại script để tiếp tục từ vị trí dừng")
+        print("=" * 70)
