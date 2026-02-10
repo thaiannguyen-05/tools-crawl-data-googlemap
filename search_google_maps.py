@@ -316,9 +316,10 @@ def export_from_state_files() -> None:
 
 
 def save_to_excel(
-    results: List[Dict[str, str]], 
-    query: str, 
-    output_dir: Path = OUTPUT_DIR
+    results: List[Dict[str, str]],
+    query: str,
+    output_dir: Path = OUTPUT_DIR,
+    include_query_col: bool = False,
 ) -> Optional[Path]:
     """
     Save crawl results to an Excel file.
@@ -354,7 +355,10 @@ def save_to_excel(
     ws.title = "Results"
     
     # Define headers
-    headers = ["STT", "Tên", "Điện thoại", "Địa chỉ", "Website", "Giờ mở cửa"]
+    if include_query_col:
+        headers = ["STT", "Query", "Tên", "Điện thoại", "Địa chỉ", "Website", "Giờ mở cửa"]
+    else:
+        headers = ["STT", "Tên", "Điện thoại", "Địa chỉ", "Website", "Giờ mở cửa"]
     
     # Header style
     header_font = Font(bold=True, color="FFFFFF")
@@ -378,14 +382,26 @@ def save_to_excel(
     # Write data
     for row, business in enumerate(results, 2):
         ws.cell(row=row, column=1, value=row - 1).border = thin_border
-        ws.cell(row=row, column=2, value=business.get('name', '')).border = thin_border
-        ws.cell(row=row, column=3, value=business.get('phone', '')).border = thin_border
-        ws.cell(row=row, column=4, value=business.get('address', '')).border = thin_border
-        ws.cell(row=row, column=5, value=business.get('website', '')).border = thin_border
-        ws.cell(row=row, column=6, value=business.get('opening_hours', '')).border = thin_border
+
+        if include_query_col:
+            ws.cell(row=row, column=2, value=business.get('query', '')).border = thin_border
+            ws.cell(row=row, column=3, value=business.get('name', '')).border = thin_border
+            ws.cell(row=row, column=4, value=business.get('phone', '')).border = thin_border
+            ws.cell(row=row, column=5, value=business.get('address', '')).border = thin_border
+            ws.cell(row=row, column=6, value=business.get('website', '')).border = thin_border
+            ws.cell(row=row, column=7, value=business.get('opening_hours', '')).border = thin_border
+        else:
+            ws.cell(row=row, column=2, value=business.get('name', '')).border = thin_border
+            ws.cell(row=row, column=3, value=business.get('phone', '')).border = thin_border
+            ws.cell(row=row, column=4, value=business.get('address', '')).border = thin_border
+            ws.cell(row=row, column=5, value=business.get('website', '')).border = thin_border
+            ws.cell(row=row, column=6, value=business.get('opening_hours', '')).border = thin_border
     
     # Adjust column widths
-    column_widths = [6, 40, 15, 60, 40, 30]
+    if include_query_col:
+        column_widths = [6, 30, 40, 15, 60, 40, 30]
+    else:
+        column_widths = [6, 40, 15, 60, 40, 30]
     for col, width in enumerate(column_widths, 1):
         ws.column_dimensions[ws.cell(row=1, column=col).column_letter].width = width
     
@@ -397,13 +413,34 @@ def save_to_excel(
     return excel_path
 
 
+def save_combined_excel(
+    results_by_query: Dict[str, List[Dict[str, str]]],
+    output_dir: Path = OUTPUT_DIR,
+) -> Optional[Path]:
+    """Save all query results into a single Excel file with a Query column."""
+    combined: List[Dict[str, str]] = []
+
+    for query, businesses in results_by_query.items():
+        for business in businesses:
+            row = dict(business)
+            row["query"] = query
+            combined.append(row)
+
+    if not combined:
+        print("   ⚠️ Không có kết quả để export (combined)")
+        return None
+    
+    # Reuse save_to_excel with query column
+    return save_to_excel(combined, query="combined", output_dir=output_dir, include_query_col=True)
+
+
 class GoogleMapsScraper:
     """Scraper Google Maps sử dụng Playwright"""
     
     def __init__(self, headless: bool = False, concurrent_tabs: int = 3):
         self.headless = headless
         self.concurrent_tabs = concurrent_tabs
-        self.max_scroll_attempts = 10  # Số lần scroll tối đa để load hết kết quả
+        self.max_scroll_attempts = 100  # Số lần scroll tối đa để load hết kết quả
         self.max_retries = 3  # Số lần retry khi timeout
     
     async def search_google_maps(self, query: str, page: Page, context: BrowserContext) -> List[Dict]:
@@ -1101,6 +1138,51 @@ def get_queries_from_args():
     return None
 
 
+def parse_cli_args(argv: List[str]):
+    """Parse CLI args for save mode, special commands, file input, and queries."""
+    save_mode = "per_query"
+    special_command = None
+    file_path = None
+    queries: List[str] = []
+
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+
+        if arg == "--export":
+            special_command = "export"
+            i += 1
+            continue
+        if arg == "--status":
+            special_command = "status"
+            i += 1
+            continue
+        if arg == "--file" and i + 1 < len(argv):
+            file_path = argv[i + 1]
+            i += 2
+            continue
+        if arg == "--save-mode" and i + 1 < len(argv):
+            save_mode = argv[i + 1].strip().lower()
+            i += 2
+            continue
+        if arg == "--combined":
+            save_mode = "combined"
+            i += 1
+            continue
+        if arg.startswith("--"):
+            i += 1
+            continue
+
+        queries.append(arg)
+        i += 1
+
+    if save_mode not in ("per_query", "combined"):
+        print(f"⚠️ save-mode không hợp lệ: {save_mode} (dùng mặc định per_query)")
+        save_mode = "per_query"
+
+    return save_mode, special_command, file_path, queries
+
+
 def get_queries_from_file(file_path: str) -> List[str]:
     """Đọc queries từ file"""
     try:
@@ -1193,40 +1275,41 @@ async def main():
     print("   📌 Features: Resume từ vị trí dừng | Graceful shutdown | Excel export")
     print("=" * 70)
     
+    save_mode, special_command, file_path, queries_from_args = parse_cli_args(sys.argv[1:])
+
     # Check for special commands
-    if len(sys.argv) >= 2:
-        if sys.argv[1] == "--export":
-            print("📊 Exporting Excel from saved state files...")
-            export_from_state_files()
-            return
-        
-        if sys.argv[1] == "--status":
-            state_files = list_saved_states()
-            if state_files:
-                print(f"\n📂 Saved states ({len(state_files)}):")
-                for sf in state_files:
-                    filename = sf.stem.replace("_state", "")
-                    state = CrawlState.load(filename)
-                    if state:
-                        status = "✅ completed" if state.completed else f"⏸️ {state.current_index}/{len(state.urls)}"
-                        print(f"   • {state.query}: {len(state.results)} results [{status}]")
-            else:
-                print("\n📂 Không có state files nào được lưu")
-            return
+    if special_command == "export":
+        print("📊 Exporting Excel from saved state files...")
+        export_from_state_files()
+        return
+
+    if special_command == "status":
+        state_files = list_saved_states()
+        if state_files:
+            print(f"\n📂 Saved states ({len(state_files)}):")
+            for sf in state_files:
+                filename = sf.stem.replace("_state", "")
+                state = CrawlState.load(filename)
+                if state:
+                    status = "✅ completed" if state.completed else f"⏸️ {state.current_index}/{len(state.urls)}"
+                    print(f"   • {state.query}: {len(state.results)} results [{status}]")
+        else:
+            print("\n📂 Không có state files nào được lưu")
+        return
     
     # ===== NHẬP QUERIES =====
     queries = None
-    
-    # Cách 1: Command line
-    queries = get_queries_from_args()
-    if queries:
+
+    # Cách 1: Command line (positional)
+    if queries_from_args:
+        queries = queries_from_args
         print(f"\n✅ Đã nhận {len(queries)} queries từ command line\n")
-    
+
     # Cách 2: Từ file
-    if not queries and len(sys.argv) == 3 and sys.argv[1] == "--file":
-        queries = get_queries_from_file(sys.argv[2])
+    if not queries and file_path:
+        queries = get_queries_from_file(file_path)
         if queries:
-            print(f"\n✅ Đã đọc {len(queries)} queries từ file: {sys.argv[2]}\n")
+            print(f"\n✅ Đã đọc {len(queries)} queries từ file: {file_path}\n")
     
     # Cách 3: Interactive
     if not queries:
@@ -1235,7 +1318,8 @@ async def main():
         print("   2. Từ file: python script.py --file queries.txt")
         print("   3. Export Excel: python script.py --export")
         print("   4. Xem status: python script.py --status")
-        print("   5. Interactive: nhập trực tiếp\n")
+        print("   5. Lưu chung: python script.py --save-mode combined")
+        print("   6. Interactive: nhập trực tiếp\n")
         
         use_interactive = input("Bạn có muốn nhập queries ngay? (y/n): ").lower()
         if use_interactive == 'y':
@@ -1254,6 +1338,7 @@ async def main():
     print(f"⚡ Chế độ: {CONCURRENT_TABS} tabs song song")
     print(f"⏱️  Delay: {DELAY_BETWEEN_SEARCHES}s giữa các query")
     print(f"💾 Auto-save: Sau mỗi {BATCH_SAVE_INTERVAL} items")
+    print(f"💾 Chế độ lưu: {save_mode}")
     
     # Print keyboard controls
     print_controls_banner()
@@ -1268,6 +1353,8 @@ async def main():
     loop = asyncio.get_event_loop()
     keyboard_controller.start(loop)
     
+    all_results_by_query: Dict[str, List[Dict[str, str]]] = {}
+
     # Process each query separately for better resume support
     for query_idx, query in enumerate(queries, 1):
         if shutdown_requested:
@@ -1412,16 +1499,21 @@ async def main():
             finally:
                 await browser.close()
         
-        # Save to Excel - ALWAYS export if there are results (even if interrupted)
+        # Track results by query for combined export
         if state.results:
-            print(f"\n   📊 Exporting {len(state.results)} results to Excel...")
-            excel_path = save_to_excel(state.results, query)
-            if excel_path:
-                print(f"   ✅ Excel exported: {excel_path}")
-                if state.completed:
-                    state.delete_state_file()
-        else:
-            print("\n   ⚠️ Không có kết quả để export")
+            all_results_by_query[query] = state.results
+
+        # Save to Excel per query (if configured)
+        if save_mode == "per_query":
+            if state.results:
+                print(f"\n   📊 Exporting {len(state.results)} results to Excel...")
+                excel_path = save_to_excel(state.results, query)
+                if excel_path:
+                    print(f"   ✅ Excel exported: {excel_path}")
+                    if state.completed:
+                        state.delete_state_file()
+            else:
+                print("\n   ⚠️ Không có kết quả để export")
         
         # Delay before next query
         if query_idx < len(queries) and not shutdown_requested:
@@ -1432,6 +1524,13 @@ async def main():
     # Stop keyboard listener
     keyboard_controller.stop()
     
+    # Combined export (if configured)
+    if save_mode == "combined" and all_results_by_query:
+        print(f"\n📊 Exporting combined results from {len(all_results_by_query)} queries...")
+        combined_path = save_combined_excel(all_results_by_query)
+        if combined_path:
+            print(f"✅ Combined Excel exported: {combined_path}")
+
     print("\n" + "=" * 70)
     if shutdown_requested:
         print("🛑 ĐÃ DỪNG - Dữ liệu đã được lưu")
